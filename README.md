@@ -78,7 +78,7 @@ If you use this repository in research, cite:
 @article{zhu2026observational,
   title={Observational Learning with Gated Information: A Lightweight RL Simulation Testbed and Latent Signal Models},
   author={Zhu, Chengyuan and Wu, Jialai},
-  journal={bioRxiv},
+  journal={research square},
   year={2026}
 }
 ```
@@ -86,4 +86,3 @@ If you use this repository in research, cite:
 ## Notes
 
 - The notebook contains historical development snapshots, so it is intentionally preserved as reference material rather than polished production code.
-- The repository no longer documents nonexistent entrypoints such as `train.py` or `evaluate.py`.
