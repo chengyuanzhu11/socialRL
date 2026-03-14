@@ -9,14 +9,14 @@ Code-first research repository for the social timing / observational learning ex
 - `main.py`: unified CLI for training, comparison suites, latent-signal simulation, and LR sweeps
 - `requirements.txt`: minimal runtime dependencies
 - `notebooks/`: archived notebook history with outputs cleared
-- `paper/`: manuscript and paper assets
+- `paper/`: paper PDF and manuscript assets
 - `outputs/`: generated figures, reports, and experiment runs; ignored for version control
 
 ## Setup
 
 ```bash
 python -m venv .venv
-.venv\\Scripts\\activate
+.venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
@@ -69,6 +69,19 @@ By default, runs write to `outputs/`. Typical artifacts include:
 - `learning_curves_*.pdf`
 - `significance_report.txt`
 - `lr_sweep_scores.txt`
+
+## Citation
+
+If you use this repository in research, cite:
+
+```bibtex
+@article{zhu2026observational,
+  title={Observational Learning with Gated Information: A Lightweight RL Simulation Testbed and Latent Signal Models},
+  author={Zhu, Chengyuan and Wu, Jialai},
+  journal={bioRxiv},
+  year={2026}
+}
+```
 
 ## Notes
 
