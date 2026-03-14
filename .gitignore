@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# Notebook and editor artifacts
+.ipynb_checkpoints/
+.vscode/
+
+# Runtime outputs
+outputs/
+debug_run/
+plots_cmp_fam/
+
+# Scratch exports
+temp_nb_code.py
