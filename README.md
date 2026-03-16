@@ -1,4 +1,4 @@
-# socialRL
+# Observational Learning with Gated Information A Lightweight RL Simulation Testbed and Latent Signal Models
 
 Code-first research repository for the social timing / observational learning experiments from "Observational Learning with Gated Information: A Lightweight RL Simulation Testbed and Latent Signal Models".
 
