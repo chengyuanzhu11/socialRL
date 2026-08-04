@@ -1,3 +1,4 @@
-numpy
-matplotlib
-torch
+--extra-index-url https://download.pytorch.org/whl/cu130
+numpy==2.4.4
+matplotlib==3.10.8
+torch==2.11.0+cu130

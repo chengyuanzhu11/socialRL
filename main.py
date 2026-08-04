@@ -11,6 +11,11 @@ import argparse
 import os
 import math
 
+from socialrl.artifacts import save_checkpoint, save_episode_logs, save_json
+from socialrl.evaluation import evaluate_policy
+from socialrl.metrics import summarize_training
+from socialrl.stats import holm_adjust, paired_sign_flip_test
+
 try:
     from torch.amp import autocast as torch_autocast
     from torch.amp import GradScaler as TorchGradScaler
@@ -118,6 +123,7 @@ class SocialLickEnv1D:
 
         # familiarity dynamics
         familiarity_enabled: bool = False,
+        include_familiarity_state: bool = True,
         familiarity_init: float = 0.0,              # persistent across episodes
         fam_decay_ep: float = 0.00,                 # applied at reset (episode boundary)
         fam_gain_obs: float = 0.00,                 # gain per OBS during teacher lick
@@ -156,6 +162,8 @@ class SocialLickEnv1D:
         self.detect_memory_steps = None if detect_memory_steps is None else int(detect_memory_steps)
 
         self.familiarity_enabled = bool(familiarity_enabled)
+        self.include_familiarity_state = bool(include_familiarity_state)
+        self.state_dim = 7 if self.include_familiarity_state else 6
         self.familiarity = clamp_float(familiarity_init, 0.0, 1.0)
         self.fam_decay_ep = clamp_float(fam_decay_ep, 0.0, 1.0)
         self.fam_gain_obs = float(fam_gain_obs)
@@ -230,9 +238,12 @@ class SocialLickEnv1D:
 
         self.eat_cd = 0
         self.last_lick_step = None
+        self.last_completed_bout_id = None
+        self.window_start_step = None
         self.detected_bout_id = None
         self._detect_ttl = None
         self.rewarded_bout_ids = set()
+        self.asocial_hit_bout_ids = set()
 
         # build cue-burst timeline
         self.bout_id_at_step = -np.ones(self.max_steps + 1, dtype=np.int32)
@@ -263,15 +274,15 @@ class SocialLickEnv1D:
         return (1, bid) if bid >= 0 else (0, -1)
 
     def _window_open(self, t: int) -> int:
-        if self.last_lick_step is None:
+        if self.window_start_step is None:
             return 0
-        dt = t - self.last_lick_step
+        dt = t - self.window_start_step
         return 1 if (0 <= dt < self.window_steps) else 0
 
     def _window_remaining(self, t: int) -> int:
-        if self.last_lick_step is None:
+        if self.window_start_step is None:
             return 0
-        dt = t - self.last_lick_step
+        dt = t - self.window_start_step
         rem = self.window_steps - dt
         return int(max(0, rem))
 
@@ -284,14 +295,23 @@ class SocialLickEnv1D:
         lf = float(self.learner_food_pos) / float(self.grid_size - 1)
         phase = float(self._phase_to_next_nominal(self.t)) / float(self.teacher_period_steps)
         cdn = float(self.eat_cd) / float(max(1, self.eat_cooldown_steps))
-        # [pos, food_pos, gated cue, gated window remaining, phase clock, cooldown]
-        return np.array([lp, lf, float(lick_sig), float(win_rem), phase, cdn], dtype=np.float32)
+        # [pos, food_pos, gated cue, gated window remaining, phase clock, cooldown, familiarity]
+        values = [lp, lf, float(lick_sig), float(win_rem), phase, cdn]
+        if self.include_familiarity_state:
+            values.append(float(self.familiarity))
+        return np.array(values, dtype=np.float32)
 
     def step(self, action: int):
         self.t += 1
         teacher_lick, bout_id = self._teacher_lick_now(self.t)
         if teacher_lick == 1:
             self.last_lick_step = self.t
+        else:
+            previous_lick, previous_bout_id = self._teacher_lick_now(self.t - 1)
+            if previous_lick == 1 and previous_bout_id >= 0:
+                # A reward window starts only after the cue burst has ended.
+                self.last_completed_bout_id = int(previous_bout_id)
+                self.window_start_step = self.t
 
         window_open = self._window_open(self.t)
         win_rem_true = self._window_remaining(self.t)
@@ -311,6 +331,7 @@ class SocialLickEnv1D:
         did_observe = 0
         did_eat = 0
         seen_lick = 0
+        new_detection = 0
 
         # distance for shaping (computed before move)
         dist_before = abs(int(self.learner_pos) - int(self.learner_food_pos))
@@ -326,8 +347,11 @@ class SocialLickEnv1D:
             # social blind => OBS reveals nothing
             if self.social_visibility > 0.0:
                 p_det = self._effective_detect_prob()
-                if teacher_lick == 1 and bout_id >= 0 and (np.random.rand() < p_det):
+                if (teacher_lick == 1 and bout_id >= 0
+                        and self.detected_bout_id != int(bout_id)
+                        and (np.random.rand() < p_det)):
                     seen_lick = 1
+                    new_detection = 1
                     self.detected_bout_id = int(bout_id)
                     if self.detect_memory_steps is not None:
                         self._detect_ttl = int(self.detect_memory_steps)
@@ -343,7 +367,7 @@ class SocialLickEnv1D:
                 # familiarity update
                 if self.familiarity_enabled and teacher_lick == 1 and bout_id >= 0:
                     self.familiarity = clamp_float(self.familiarity + self.fam_gain_obs, 0.0, 1.0)
-                    if seen_lick == 1:
+                    if new_detection == 1:
                         self.familiarity = clamp_float(self.familiarity + self.fam_gain_detect, 0.0, 1.0)
 
         elif action == A_EAT:
@@ -358,14 +382,12 @@ class SocialLickEnv1D:
         reward -= self._effective_observe_cost() * float(did_observe)
         reward -= self.eat_cost * float(did_eat)
 
-        # shaping: reward OBS during cue only if bout not yet detected
-        # (kept exactly as your template, except attend_bonus can be boosted by familiarity)
-        if did_observe == 1 and teacher_lick == 1 and bout_id >= 0:
-            if self.detected_bout_id != int(bout_id):
-                reward += self._effective_attend_bonus()
+        # Reward the first successful cue detection, not unsuccessful observations.
+        if new_detection == 1:
+            reward += self._effective_attend_bonus()
 
         # empathy: intrinsic reward when OBS successfully sees lick
-        if self.empathy_enabled and did_observe == 1 and seen_lick == 1:
+        if self.empathy_enabled and new_detection == 1:
             reward += self.empathy_seen_reward
 
         # eat allowed+/-
@@ -375,17 +397,22 @@ class SocialLickEnv1D:
 
         # success logic (1 reward per bout)
         eat_valid = 0
+        asocial_window_hit = 0
         latency_steps = None
-        last_bid = -1
-        if self.last_lick_step is not None and self.last_lick_step <= self.max_steps:
-            last_bid = int(self.bout_id_at_step[self.last_lick_step])
+        last_bid = -1 if self.last_completed_bout_id is None else int(self.last_completed_bout_id)
+        at_food = self.learner_pos == self.learner_food_pos
 
-        if eat_allowed and (self.learner_pos == self.learner_food_pos) and (window_open == 1) and (self.last_lick_step is not None):
+        if eat_allowed and at_food and window_open == 1 and last_bid >= 0:
+            if last_bid not in self.asocial_hit_bout_ids:
+                asocial_window_hit = 1
+                self.asocial_hit_bout_ids.add(last_bid)
+
+        if eat_allowed and at_food and window_open == 1:
             if (last_bid >= 0) and (self.detected_bout_id == last_bid) and (last_bid not in self.rewarded_bout_ids):
                 eat_valid = 1
                 self.rewarded_bout_ids.add(last_bid)
                 reward += 1.0
-                latency_steps = int(self.t - int(self.last_lick_step))
+                latency_steps = int(self.t - int(self.window_start_step))
 
                 # familiarity: reward earlier eating (shorter latency)
                 if self.familiarity_enabled and self.fam_latency_bonus > 0.0:
@@ -415,9 +442,13 @@ class SocialLickEnv1D:
             "observe": int(did_observe),
             "eat": int(did_eat),
             "eat_allowed": int(eat_allowed),
+            "at_food": int(at_food),
             "eat_valid": int(eat_valid),
+            "asocial_window_hit": int(asocial_window_hit),
             "latency_steps": -1 if latency_steps is None else int(latency_steps),
             "last_lick_step": -1 if self.last_lick_step is None else int(self.last_lick_step),
+            "last_completed_bout_id": int(last_bid),
+            "window_start_step": -1 if self.window_start_step is None else int(self.window_start_step),
             "learner_pos": int(self.learner_pos),
             "food_pos": int(self.learner_food_pos),
             "seen_lick": int(seen_lick),
@@ -450,34 +481,42 @@ def _save_fig(fig, out_path_no_ext: str, ext: str, pdf_pages: Optional[PdfPages]
 
 def ema_1d(y: np.ndarray, alpha: float = 0.02) -> np.ndarray:
     y = np.asarray(y, dtype=np.float32)
-    out = np.zeros_like(y)
-    m = 0.0
+    out = np.full_like(y, np.nan)
+    m = np.nan
     for i in range(len(y)):
         if np.isnan(y[i]):
             out[i] = m
             continue
-        m = (1 - alpha) * m + alpha * y[i]
+        m = float(y[i]) if np.isnan(m) else (1 - alpha) * m + alpha * y[i]
         out[i] = m
     return out
 
-def logs_to_array_with_ffill(logs: List[Dict[str, float]], metric: str, target_len: int) -> np.ndarray:
+def logs_to_array(logs: List[Dict[str, float]], metric: str, target_len: int, forward_fill: bool = False) -> np.ndarray:
     y = np.full((target_len,), np.nan, dtype=np.float32)
     if len(logs) == 0:
         return y
     vals = [float(d.get(metric, np.nan)) for d in logs]
     L = min(len(vals), target_len)
     y[:L] = np.array(vals[:L], dtype=np.float32)
-    if L < target_len and L > 0 and not np.isnan(y[L-1]):
+    if forward_fill and L < target_len and L > 0 and not np.isnan(y[L-1]):
         y[L:] = y[L-1]
     return y
 
+
+def logs_to_array_with_ffill(logs: List[Dict[str, float]], metric: str, target_len: int) -> np.ndarray:
+    """Deprecated compatibility wrapper that no longer biases early-stopped tails."""
+    return logs_to_array(logs, metric, target_len, forward_fill=False)
+
 def mean_sem(arr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    mean = np.nanmean(arr, axis=0)
+    mean = np.full(arr.shape[1], np.nan, dtype=np.float32)
     sem = np.zeros_like(mean, dtype=np.float32)
     for t in range(arr.shape[1]):
         col = arr[:, t]
         col = col[~np.isnan(col)]
-        if len(col) <= 1:
+        if len(col) == 0:
+            continue
+        mean[t] = float(np.mean(col))
+        if len(col) == 1:
             sem[t] = 0.0
         else:
             sem[t] = float(np.std(col, ddof=1) / math.sqrt(len(col)))
@@ -514,6 +553,7 @@ def plot_comparison_curves_mean_sem(
     plt.legend(fontsize=8)
     plt.tight_layout()
     _save_fig(fig, os.path.join(save_dir, f"compare_{metric}_mean_sem"), ext=ext, pdf_pages=pdf_pages)
+    plt.close(fig)
 
 def plot_single_learning_panel_mean_sem(
     runs: List[List[Dict[str, float]]],
@@ -533,8 +573,9 @@ def plot_single_learning_panel_mean_sem(
 
     m_succ, s_succ = get_ms("bout_success_rate")
     m_obs, s_obs = get_ms("obs_rate")
-    m_seen, s_seen = get_ms("obs_seen_lick_rate")
+    m_seen, s_seen = get_ms("obs_detect_rate")
     m_eatw, s_eatw = get_ms("eat_in_window_rate")
+    m_asocial, s_asocial = get_ms("asocial_window_hit_rate")
     m_lat, s_lat = get_ms("mean_latency_s")
     m_fam, s_fam = get_ms("familiarity")
     m_lr, s_lr = get_ms("lr")
@@ -549,12 +590,13 @@ def plot_single_learning_panel_mean_sem(
 
     plt.subplot(1, 3, 2)
     plot_metric_mean_sem(ep, m_obs, s_obs, label="observe")
-    plot_metric_mean_sem(ep, m_seen, s_seen, label="obs sees cue")
+    plot_metric_mean_sem(ep, m_seen, s_seen, label="detect given observe")
     plt.title("EMA observation metrics")
     plt.xlabel("episode"); plt.legend(fontsize=8)
 
     plt.subplot(1, 3, 3)
-    plot_metric_mean_sem(ep, m_eatw, s_eatw, label="eat in window")
+    plot_metric_mean_sem(ep, m_eatw, s_eatw, label="eat at food in window")
+    plot_metric_mean_sem(ep, m_asocial, s_asocial, label="asocial window hit")
     plot_metric_mean_sem(ep, m_lat, s_lat, label="latency (s)")
     if np.nanmax(m_fam) > 1e-6:
         plot_metric_mean_sem(ep, m_fam, s_fam, label="familiarity")
@@ -565,6 +607,7 @@ def plot_single_learning_panel_mean_sem(
 
     plt.tight_layout()
     _save_fig(fig, os.path.join(save_dir, "learning_curves_mean_sem"), ext=ext, pdf_pages=pdf_pages)
+    plt.close(fig)
 
 # ============================================================
 # Significance tests (no SciPy)
@@ -701,7 +744,7 @@ def simulate_latent_models_for_episode(tr, agent, gamma=0.99, ep_frac=0.0, gae_l
     return impulses
 
 def simulate_and_plot_latents(traces, agent, dt_s, gamma=0.99,
-                              save_dir="outputs", ext="pdf", pdf_pages=None):
+                              save_dir="outputs", ext="pdf", pdf_pages=None, make_plot=True):
     impulses_by_model = defaultdict(list)
     n = len(traces)
     for i, tr in enumerate(traces):
@@ -713,6 +756,62 @@ def simulate_and_plot_latents(traces, agent, dt_s, gamma=0.99,
     phot_by_model = {}
     for k, imps in impulses_by_model.items():
         phot_by_model[k] = [calcium_filter(x, dt_s=dt_s, tau_rise_s=0.2, tau_decay_s=1.2) for x in imps]
+
+    ensure_dir(save_dir)
+    np.savez_compressed(
+        os.path.join(save_dir, "latent_impulses.npz"),
+        **{name: np.stack(values).astype(np.float32) for name, values in impulses_by_model.items()},
+    )
+
+    def _event_indices(trace, event_name):
+        if event_name == "cue_end":
+            cue = np.asarray(trace["teacher_lick"], dtype=np.int8)
+            return np.flatnonzero((cue[:-1] == 1) & (cue[1:] == 0)) + 1
+        if event_name == "reward":
+            return np.flatnonzero(np.asarray(trace["eat_valid"], dtype=np.int8) == 1)
+        if event_name == "observe_detect":
+            return np.flatnonzero(np.asarray(trace["seen_lick"], dtype=np.int8) == 1)
+        raise ValueError(f"Unknown event: {event_name}")
+
+    def _peri_event_average(model_name, event_name, episode_indices, pre_steps=12, post_steps=20):
+        snippets = []
+        for episode_index in episode_indices:
+            signal = phot_by_model[model_name][episode_index]
+            for event_index in _event_indices(traces[episode_index], event_name):
+                if event_index - pre_steps < 0 or event_index + post_steps >= len(signal):
+                    continue
+                snippets.append(signal[event_index - pre_steps:event_index + post_steps + 1])
+        if not snippets:
+            return None
+        return np.mean(np.stack(snippets), axis=0)
+
+    if not make_plot:
+        return phot_by_model
+
+    model_name = "reward_RPE"
+    event_specs = [("cue_end", "cue end"), ("reward", "reward"), ("observe_detect", "observe-detect")]
+    early = range(0, max(1, int(np.ceil(n * 0.2))))
+    late = range(max(0, n - max(1, int(np.ceil(n * 0.2)))), n)
+    time_axis = np.arange(-12, 21, dtype=np.float32) * float(dt_s)
+    fig, axes = plt.subplots(1, len(event_specs), figsize=(13, 3.8), sharey=True)
+    for axis, (event_name, title) in zip(axes, event_specs):
+        early_mean = _peri_event_average(model_name, event_name, early)
+        late_mean = _peri_event_average(model_name, event_name, late)
+        if early_mean is not None:
+            axis.plot(time_axis, early_mean, label="early (first 20%)")
+        if late_mean is not None:
+            axis.plot(time_axis, late_mean, label="late (last 20%)")
+        axis.axvline(0.0, color="black", linewidth=0.8, linestyle="--")
+        axis.set_title(title)
+        axis.set_xlabel("time from event (s)")
+    axes[0].set_ylabel("filtered reward RPE")
+    handles, labels = axes[0].get_legend_handles_labels()
+    if handles:
+        axes[0].legend(fontsize=8)
+    fig.suptitle("Peri-event latent signal averages")
+    fig.tight_layout()
+    _save_fig(fig, os.path.join(save_dir, "latent_reward_rpe_peri_event"), ext=ext, pdf_pages=pdf_pages)
+    plt.close(fig)
     return phot_by_model
 
 
@@ -721,6 +820,8 @@ def simulate_and_plot_latents(traces, agent, dt_s, gamma=0.99,
 # ============================================================
 class BaseAgent:
     def act(self, s: np.ndarray):
+        raise NotImplementedError
+    def act_deterministic(self, s: np.ndarray) -> int:
         raise NotImplementedError
     def record_transition(self, s, a, r, s2, done, extra):
         pass
@@ -841,6 +942,11 @@ class DQNAgent(BaseAgent):
             qv = self.q(st)
         return int(torch.argmax(qv, dim=1).item()), {}
 
+    def act_deterministic(self, s: np.ndarray) -> int:
+        st = torch.tensor(s, dtype=torch.float32, device=self.device).unsqueeze(0)
+        with torch.no_grad():
+            return int(torch.argmax(self.q(st), dim=1).item())
+
     def record_transition(self, s, a, r, s2, done, extra):
         self.rb.push(s, a, r, s2, done)
 
@@ -947,6 +1053,12 @@ class PPOAgent(BaseAgent):
             ent = dist.entropy()
         return int(a.item()), {"logp": float(logp.item()), "v": float(v.item()), "ent": float(ent.item())}
 
+    def act_deterministic(self, s: np.ndarray) -> int:
+        st = torch.tensor(s, dtype=torch.float32, device=self.device).unsqueeze(0)
+        with torch.no_grad():
+            logits, _ = self.net(st)
+        return int(torch.argmax(logits, dim=1).item())
+
     def record_transition(self, s, a, r, s2, done, extra):
         self.roll.append({
             "s": np.array(s, dtype=np.float32),
@@ -1040,7 +1152,7 @@ class PPOAgent(BaseAgent):
 # -------------------------
 class TabularQAgent(BaseAgent):
     def __init__(self, action_dim=5, alpha=0.25, gamma=0.99, eps_start=1.0, eps_end=0.05, eps_decay=0.9995,
-                 phase_bins=10, win_bins=7, cd_bins=6):
+                 phase_bins=10, win_bins=7, cd_bins=6, fam_bins=11):
         self.action_dim = int(action_dim)
         self.alpha = float(alpha)
         self.gamma = float(gamma)
@@ -1051,10 +1163,11 @@ class TabularQAgent(BaseAgent):
         self.phase_bins = int(phase_bins)
         self.win_bins = int(win_bins)
         self.cd_bins = int(cd_bins)
+        self.fam_bins = int(fam_bins)
         self.Q = defaultdict(lambda: np.zeros(self.action_dim, dtype=np.float32))
 
     def _disc(self, s: np.ndarray):
-        lp, lf, lick, win, phase, cd = s.tolist()
+        lp, lf, lick, win, phase, cd, *rest = s.tolist()
         p = int(np.round(lp * 14))
         f = int(np.round(lf * 14))
         lickb = int(lick > 0.5)
@@ -1064,7 +1177,9 @@ class TabularQAgent(BaseAgent):
         phb = clamp_int(phb, 0, self.phase_bins - 1)
         cdb = int(np.round(cd * (self.cd_bins - 1)))
         cdb = clamp_int(cdb, 0, self.cd_bins - 1)
-        return (p, f, lickb, winb, phb, cdb)
+        famb = int(np.round((rest[0] if rest else 0.0) * (self.fam_bins - 1)))
+        famb = clamp_int(famb, 0, self.fam_bins - 1)
+        return (p, f, lickb, winb, phb, cdb, famb)
 
     def act(self, s):
         key = self._disc(s)
@@ -1073,6 +1188,9 @@ class TabularQAgent(BaseAgent):
         else:
             a = int(np.argmax(self.Q[key]))
         return a, {"key": key}
+
+    def act_deterministic(self, s: np.ndarray) -> int:
+        return int(np.argmax(self.Q[self._disc(s)]))
 
     def record_transition(self, s, a, r, s2, done, extra):
         k = extra["key"]
@@ -1115,6 +1233,7 @@ def train_social_with_latents(
         obs_steps = 0
         obs_seen = 0
         eat_in_win = 0
+        asocial_hits = 0
         latencies_steps = []
 
         tr = defaultdict(list)
@@ -1132,8 +1251,10 @@ def train_social_with_latents(
                 obs_steps += 1
                 if info["seen_lick"] == 1:
                     obs_seen += 1
-            if info["eat"] == 1 and info["window_open"] == 1:
+            if info["eat_allowed"] == 1 and info["at_food"] == 1 and info["window_open"] == 1:
                 eat_in_win += 1
+            if info["asocial_window_hit"] == 1:
+                asocial_hits += 1
 
             if compute_latents:
                 tr["state"].append(s.copy())
@@ -1170,9 +1291,10 @@ def train_social_with_latents(
         logs.append({
             "ep": ep,
             "bout_success_rate": float(succ_bouts / n_bouts),
+            "asocial_window_hit_rate": float(asocial_hits / n_bouts),
             "mean_reward": float(ep_reward),
             "obs_rate": float(obs_steps / max(1, env.max_steps)),
-            "obs_seen_lick_rate": float(obs_seen / max(1, env.max_steps)),
+            "obs_detect_rate": float(obs_seen / max(1, obs_steps)),
             "eat_in_window_rate": float(eat_in_win / max(1, env.max_steps)),
             "mean_latency_s": float(mean_latency_s),
 
@@ -1191,7 +1313,7 @@ def train_social_with_latents(
                 f"boutSucc={np.mean([x['bout_success_rate'] for x in recent]):.3f} "
                 f"lat={np.nanmean([x['mean_latency_s'] for x in recent]):.3f}s "
                 f"obs={np.mean([x['obs_rate'] for x in recent]):.3f} "
-                f"obsSeen={np.mean([x['obs_seen_lick_rate'] for x in recent]):.3f} "
+                f"obsDetect={np.mean([x['obs_detect_rate'] for x in recent]):.3f} "
                 f"eatWin={np.mean([x['eat_in_window_rate'] for x in recent]):.3f} "
                 f"R={np.mean([x['mean_reward'] for x in recent]):.3f} "
                 f"eps={logs[-1]['eps']:.3f} "
@@ -1210,6 +1332,10 @@ def train_social_with_latents(
 # Condition builder (teacher palatability UNCHANGED)
 # ============================================================
 def build_env_for_condition(args, teacher_pal: str, learner_profile: str, familiarity_mode: str, empathy_mode: str):
+    # "impaired" describes an algorithmic sensory ablation. Keep the former
+    # spelling as an input alias so existing commands remain runnable.
+    if learner_profile == "autistic":
+        learner_profile = "impaired"
     lick_mean = args.lick_mean_s
     if teacher_pal == "high":
         lick_mean = args.pal_high_lick_mean_s
@@ -1239,6 +1365,7 @@ def build_env_for_condition(args, teacher_pal: str, learner_profile: str, famili
         detect_memory_steps=None,
 
         familiarity_enabled=(familiarity_mode == "on"),
+        include_familiarity_state=not args.hide_familiarity_state,
         familiarity_init=args.fam_init,
         fam_decay_ep=args.fam_decay_ep,
         fam_gain_obs=args.fam_gain_obs,
@@ -1262,7 +1389,7 @@ def build_env_for_condition(args, teacher_pal: str, learner_profile: str, famili
         pass
     elif learner_profile == "blind":
         env_kwargs["social_visibility"] = 0.0
-    elif learner_profile == "autistic":
+    elif learner_profile == "impaired":
         env_kwargs["p_detect_per_obs"] = args.aut_p_detect_per_obs
         env_kwargs["win_rem_noise_steps"] = args.aut_win_rem_noise_steps
         env_kwargs["detect_memory_steps"] = args.aut_detect_memory_steps
@@ -1277,8 +1404,17 @@ def build_env_for_condition(args, teacher_pal: str, learner_profile: str, famili
 
     return SocialLickEnv1D(**env_kwargs)
 
+def resolve_device(device_name: str) -> torch.device:
+    if device_name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device_name == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("--device cuda was requested but CUDA is unavailable")
+    return torch.device(device_name)
+
+
 def build_agent(args, state_dim=6, action_dim=5, lr_override: Optional[float] = None):
     lr_use = float(args.lr if lr_override is None else lr_override)
+    device = resolve_device(args.device)
     if args.algo == "dqn":
         return DQNAgent(
             state_dim=state_dim,
@@ -1292,6 +1428,7 @@ def build_agent(args, state_dim=6, action_dim=5, lr_override: Optional[float] = 
             eps_decay=args.eps_decay,
             tau=args.tau,
             grad_clip=args.grad_clip,
+            device=device,
             use_compile=args.use_compile,
         )
     elif args.algo == "ppo":
@@ -1307,6 +1444,7 @@ def build_agent(args, state_dim=6, action_dim=5, lr_override: Optional[float] = 
             train_epochs=args.ppo_epochs,
             minibatch_size=args.minibatch_size,
             max_grad_norm=args.max_grad_norm,
+            device=device,
         )
     elif args.algo == "tabular":
         return TabularQAgent(
@@ -1325,6 +1463,18 @@ def build_agent(args, state_dim=6, action_dim=5, lr_override: Optional[float] = 
 # ============================================================
 def run_single_condition_multi_seed(args, teacher_pal: str, learner_profile: str, familiarity_mode: str, empathy_mode: str, out_dir: str):
     ensure_dir(out_dir)
+    save_json(os.path.join(out_dir, "config.json"), {
+        "args": vars(args),
+        "condition": {
+            "teacher_pal": teacher_pal,
+            "learner_profile": learner_profile,
+            "familiarity": familiarity_mode,
+            "empathy": empathy_mode,
+        },
+        "torch_version": torch.__version__,
+        "cuda_available": torch.cuda.is_available(),
+        "device": str(resolve_device(args.device)),
+    })
 
     pdf_pages = None
     if args.plot_ext.lower() == "pdf" and args.multipage_pdf:
@@ -1337,18 +1487,42 @@ def run_single_condition_multi_seed(args, teacher_pal: str, learner_profile: str
         set_seed(seed_i)
         env = build_env_for_condition(args, teacher_pal=teacher_pal, learner_profile=learner_profile,
                                       familiarity_mode=familiarity_mode, empathy_mode=empathy_mode)
-        agent = build_agent(args, state_dim=6, action_dim=5)
+        agent = build_agent(args, state_dim=env.state_dim, action_dim=5)
 
-        logs, _traces = train_social_with_latents(
+        logs, traces = train_social_with_latents(
             env, agent,
             episodes=args.episodes,
             log_every=max(50, args.episodes // 12),
             updates_per_step=args.updates_per_step,
             early_stop_threshold=args.early_stop_threshold,
             early_stop_window=args.early_stop_window,
-            compute_latents=False,  # off for multi-seed
+            compute_latents=(i == 0 and not args.no_latents),
         )
         runs_logs.append(logs)
+        seed_dir = os.path.join(out_dir, f"seed_{seed_i}")
+        save_episode_logs(os.path.join(seed_dir, "train_episode_metrics.csv"), logs)
+        save_json(os.path.join(seed_dir, "training_summary.json"), summarize_training(
+            logs, threshold=args.early_stop_threshold, window=args.early_stop_window,
+        ))
+
+        evaluation_logs = evaluate_policy(env, agent, episodes=args.eval_episodes)
+        save_episode_logs(os.path.join(seed_dir, "evaluation_episode_metrics.csv"), evaluation_logs)
+        save_json(os.path.join(seed_dir, "evaluation_summary.json"), {
+            "episodes": args.eval_episodes,
+            "mean_bout_success_rate": float(np.nanmean([row["bout_success_rate"] for row in evaluation_logs])),
+            "mean_asocial_window_hit_rate": float(np.nanmean([row["asocial_window_hit_rate"] for row in evaluation_logs])),
+            "mean_reward": float(np.nanmean([row["mean_reward"] for row in evaluation_logs])),
+        })
+        if not args.no_checkpoints:
+            save_checkpoint(os.path.join(seed_dir, "checkpoint.pt"), agent, {
+                "seed": seed_i,
+                "episodes_completed": len(logs),
+                "condition": f"T={teacher_pal}|L={learner_profile}|F={familiarity_mode}|E={empathy_mode}",
+            })
+        if traces:
+            simulate_and_plot_latents(traces, agent, dt_s=env.dt_s, gamma=args.gamma,
+                                      save_dir=seed_dir, ext=args.plot_ext, pdf_pages=None,
+                                      make_plot=not args.no_plots)
 
     if not args.no_plots:
         title_suffix = f" (T={teacher_pal}, L={learner_profile}, fam={familiarity_mode}, emp={empathy_mode}, n={args.n_seeds})"
@@ -1379,7 +1553,7 @@ def run_comparison_suite_multi_seed(args):
         cmp_pdf = PdfPages(os.path.join(base_dir, f"comparison_suite_{args.algo}_mean_sem.pdf"))
 
     teacher_pals = ["high", "low"] if args.compare_teacher_pal else [args.teacher_pal]
-    profiles = ["normal", "blind", "autistic"] if args.compare_profiles else [args.learner_profile]
+    profiles = ["normal", "blind", "impaired"] if args.compare_profiles else [args.learner_profile]
     fam_modes = ["off", "on"] if args.compare_familiarity else [args.familiarity]
     emp_modes = ["off", "on"] if args.compare_empathy else [args.empathy]
 
@@ -1415,10 +1589,14 @@ def run_comparison_suite_multi_seed(args):
                                         save_dir=base_dir, ext=args.plot_ext, pdf_pages=cmp_pdf,
                                         alpha_ema=args.alpha_ema,
                                         title="Observe rate (mean +/- SEM)")
-        plot_comparison_curves_mean_sem(results, metric="obs_seen_lick_rate", episodes=args.episodes,
+        plot_comparison_curves_mean_sem(results, metric="obs_detect_rate", episodes=args.episodes,
                                         save_dir=base_dir, ext=args.plot_ext, pdf_pages=cmp_pdf,
                                         alpha_ema=args.alpha_ema,
-                                        title="OBS sees cue rate (mean +/- SEM)")
+                                        title="Cue detection conditional on observation (mean +/- SEM)")
+        plot_comparison_curves_mean_sem(results, metric="asocial_window_hit_rate", episodes=args.episodes,
+                                        save_dir=base_dir, ext=args.plot_ext, pdf_pages=cmp_pdf,
+                                        alpha_ema=args.alpha_ema,
+                                        title="Asocial window-hit rate (mean +/- SEM)")
         plot_comparison_curves_mean_sem(results, metric="mean_latency_s", episodes=args.episodes,
                                         save_dir=base_dir, ext=args.plot_ext, pdf_pages=cmp_pdf,
                                         alpha_ema=args.alpha_ema,
@@ -1427,20 +1605,28 @@ def run_comparison_suite_multi_seed(args):
     if cmp_pdf is not None:
         cmp_pdf.close()
 
-    stats_path = os.path.join(base_dir, "significance_report.txt")
-    with open(stats_path, "w", encoding="utf-8") as f:
-        f.write("Permutation-test significance on LAST-K episode-window means.\n")
-        f.write(f"metric_last_k={args.stats_last_k}, n_perm={args.stats_n_perm}, seed={args.seed}\n\n")
+    stats_records = []
 
     # helper for pairwise tests
     def _pairwise(a_lab, b_lab, group_key):
         a_runs = results[a_lab]; b_runs = results[b_lab]
-        for metric in ["bout_success_rate", "mean_reward", "obs_seen_lick_rate", "mean_latency_s"]:
+        for metric in ["bout_success_rate", "asocial_window_hit_rate", "mean_reward", "obs_detect_rate", "mean_latency_s"]:
             a_scores = last_k_window_scores(a_runs, metric, args.episodes, args.stats_last_k)
             b_scores = last_k_window_scores(b_runs, metric, args.episodes, args.stats_last_k)
-            pval = permutation_test_mean_diff(a_scores, b_scores, n_perm=args.stats_n_perm, seed=args.seed)
-            d = cohen_d(a_scores, b_scores)
-            write_stats_report(stats_path, group_key, metric, a_lab, b_lab, a_scores, b_scores, pval, d)
+            valid = ~(np.isnan(a_scores) | np.isnan(b_scores))
+            diffs = a_scores[valid] - b_scores[valid]
+            paired_d = float(np.mean(diffs) / np.std(diffs, ddof=1)) if len(diffs) > 1 and np.std(diffs, ddof=1) > 1e-12 else float("nan")
+            pval = paired_sign_flip_test(a_scores, b_scores, seed=args.seed, max_permutations=args.stats_n_perm) if len(diffs) >= 2 else float("nan")
+            stats_records.append({
+                "group": group_key,
+                "metric": metric,
+                "a_label": a_lab,
+                "b_label": b_lab,
+                "a_scores": a_scores,
+                "b_scores": b_scores,
+                "p_unadjusted": pval,
+                "paired_d": paired_d,
+            })
 
     # Compare empathy on/off within each (T,L,F)
     if args.compare_empathy:
@@ -1460,7 +1646,7 @@ def run_comparison_suite_multi_seed(args):
             if "off" in m and "on" in m:
                 _pairwise(m["off"], m["on"], group_key=f"T={tp},L={pr},E={em}  (F off vs on)")
 
-    # Compare profiles (normal vs blind/autistic) within each (T,F,E)
+    # Compare profiles (normal vs blind/impaired) within each (T,F,E)
     if args.compare_profiles:
         groups = defaultdict(dict)  # (tp,fm,em) -> {profile: label}
         for label, (tp, pr, fm, em) in meta.items():
@@ -1468,9 +1654,26 @@ def run_comparison_suite_multi_seed(args):
         for (tp, fm, em), m in groups.items():
             if "normal" in m and "blind" in m:
                 _pairwise(m["normal"], m["blind"], group_key=f"T={tp},F={fm},E={em}  (normal vs blind)")
-            if "normal" in m and "autistic" in m:
-                _pairwise(m["normal"], m["autistic"], group_key=f"T={tp},F={fm},E={em}  (normal vs autistic)")
+            if "normal" in m and "impaired" in m:
+                _pairwise(m["normal"], m["impaired"], group_key=f"T={tp},F={fm},E={em}  (normal vs impaired)")
 
+    adjusted_pvalues = holm_adjust([record["p_unadjusted"] for record in stats_records])
+    stats_path = os.path.join(base_dir, "significance_report.txt")
+    def _score_summary(scores):
+        valid_scores = scores[~np.isnan(scores)]
+        return len(valid_scores), (float(np.mean(valid_scores)) if len(valid_scores) else float("nan"))
+    with open(stats_path, "w", encoding="utf-8") as f:
+        f.write("Paired sign-flip tests on last-K episode-window means.\n")
+        f.write(f"metric_last_k={args.stats_last_k}, multiplicity=Holm-Bonferroni, seed={args.seed}\n\n")
+        for record, adjusted in zip(stats_records, adjusted_pvalues):
+            a_scores = record["a_scores"]
+            b_scores = record["b_scores"]
+            a_count, a_mean = _score_summary(a_scores)
+            b_count, b_mean = _score_summary(b_scores)
+            f.write(f"[{record['group']}] metric={record['metric']}\n")
+            f.write(f"  {record['a_label']}: n={a_count} mean={a_mean:.4f}\n")
+            f.write(f"  {record['b_label']}: n={b_count} mean={b_mean:.4f}\n")
+            f.write(f"  paired sign-flip p={record['p_unadjusted']:.6f}  Holm-adjusted p={adjusted:.6f}  paired_d={record['paired_d']:.4f}\n\n")
     print("\nSaved significance report:", stats_path)
     return results
 
@@ -1513,7 +1716,7 @@ def run_lr_sweep(args):
             seed_i = args.seed + i * args.seed_stride
             set_seed(seed_i)
             env = build_env_for_condition(args, teacher_pal=tp, learner_profile=pr, familiarity_mode=fm, empathy_mode=em)
-            agent = build_agent(args, state_dim=6, action_dim=5, lr_override=lr)
+            agent = build_agent(args, state_dim=env.state_dim, action_dim=5, lr_override=lr)
             logs, _tr = train_social_with_latents(
                 env, agent,
                 episodes=args.episodes,
@@ -1523,8 +1726,8 @@ def run_lr_sweep(args):
                 early_stop_window=args.early_stop_window,
                 compute_latents=False,
             )
-            y = logs_to_array_with_ffill(logs, "bout_success_rate", args.episodes)
-            scores.append(float(np.mean(y[-args.stats_last_k:])))
+            y = logs_to_array(logs, "bout_success_rate", args.episodes)
+            scores.append(float(np.nanmean(y[-args.stats_last_k:])))
         scores = np.array(scores, dtype=np.float32)
         raw_means[lr] = scores
         m = float(np.mean(scores))
@@ -1543,6 +1746,7 @@ def run_lr_sweep(args):
     plt.title("LR sweep: mean +/- SEM")
     plt.tight_layout()
     _save_fig(fig, os.path.join(base_dir, "lr_sweep_bout_success_mean_sem"), ext=args.plot_ext, pdf_pages=None)
+    plt.close(fig)
 
     out_txt = os.path.join(base_dir, "lr_sweep_scores.txt")
     with open(out_txt, "w", encoding="utf-8") as f:
@@ -1559,7 +1763,7 @@ def run_experiment(args):
     ensure_dir(args.save_dir)
 
     if args.lr_sweep is not None and args.lr_sweep.strip() != "":
-        run_lr_sweep(args)
+        return run_lr_sweep(args)
 
     if args.compare_suite:
         return run_comparison_suite_multi_seed(args)
@@ -1588,6 +1792,9 @@ def build_argparser():
     p.add_argument("--seed_stride", type=int, default=1000, help="seed_i = seed + i*seed_stride")
     p.add_argument("--n_seeds", type=int, default=5, help="replicate runs per condition for SEM/statistics")
     p.add_argument("--save_dir", type=str, default="outputs")
+    p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    p.add_argument("--eval_episodes", type=int, default=20, help="greedy/stochastic-policy evaluation episodes after each seed")
+    p.add_argument("--no_checkpoints", action="store_true", help="do not save per-seed model checkpoints")
     p.add_argument("--no_plots", action="store_true")
     p.add_argument("--plot_ext", type=str, default="pdf", choices=["pdf", "png"])
     p.add_argument("--multipage_pdf", action="store_true")
@@ -1652,10 +1859,12 @@ def build_argparser():
     p.add_argument("--pal_low_lick_mean_s", type=float, default=0.6)
 
     # learner
-    p.add_argument("--learner_profile", type=str, default="normal", choices=["normal", "blind", "autistic"])
+    p.add_argument("--learner_profile", type=str, default="normal", choices=["normal", "blind", "impaired", "autistic"],
+                   help="autistic is a legacy alias for the impaired sensory-tracking ablation")
 
     # familiarity toggle
     p.add_argument("--familiarity", type=str, default="off", choices=["off", "on"])
+    p.add_argument("--hide_familiarity_state", action="store_true", help="use the historical six-dimensional observation")
 
     # empathy toggle
     p.add_argument("--empathy", type=str, default="off", choices=["off", "on"])
@@ -1703,6 +1912,8 @@ def build_argparser():
 def main(cli_args=None):
     parser = build_argparser()
     args = parser.parse_args(cli_args)
+    if args.learner_profile == "autistic":
+        args.learner_profile = "impaired"
     return run_experiment(args)
 
 
